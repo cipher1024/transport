@@ -1,23 +1,20 @@
-
+import data.list.basic
 import data.equiv
+
+import tactic.refine
 
 universes u v w
 
 class canonical_equiv (α : Sort*) (β : Sort*) extends equiv α β.
 
-class transportable (f : Type u → Type u) :=
+class transportable (f : Type u → Type v) :=
 (on_equiv : Π {α β : Type u} (e : equiv α β), equiv (f α) (f β))
 (on_refl  : Π (α : Type u), on_equiv (equiv.refl α) = equiv.refl (f α))
 (on_trans : Π {α β γ : Type u} (d : equiv α β) (e : equiv β γ), on_equiv (equiv.trans d e) = equiv.trans (on_equiv d) (on_equiv e))
 
 -- Finally a command like: `initialize_transport group` would create the next two declarations automagically:
 
-#print group
-
 open transportable
-
-#print transportable
-
 
 definition equiv_mul {α β : Type u} : equiv α β → equiv (has_mul α) (has_mul β) := λ E,
 { to_fun :=  λ αmul,⟨λ b1 b2, E.to_fun (@has_mul.mul α αmul (E.inv_fun b1) (E.inv_fun b2))⟩,
@@ -41,7 +38,133 @@ definition equiv_mul {α β : Type u} : equiv α β → equiv (has_mul α) (has_
   end, -- didn't I just write that?
 }
 
+namespace tactic
 
+meta def instance_derive_handler' (cls : name) (tac : name → expr → tactic unit) (univ_poly := tt)
+  (modify_target : name → list expr → expr → tactic expr := λ _ _, pure) : derive_handler :=
+λ p n, do
+if p.is_constant_of cls then
+do decl ← get_decl n,
+   cls_decl ← get_decl cls,
+   env ← get_env,
+   -- guard (env.is_inductive n) <|> fail format!"failed to derive '{cls}', '{n}' is not an inductive type",
+   let ls := decl.univ_params.map $ λ n, if univ_poly then level.param n else level.zero,
+   -- incrementally build up target expression `Π (hp : p) [cls hp] ..., cls (n.{ls} hp ...)`
+   -- where `p ...` are the inductive parameter types of `n`
+   let tgt : expr := expr.const n ls,
+   ⟨params, _⟩ ← mk_local_pis (decl.type.instantiate_univ_params (decl.univ_params.zip ls)),
+   (type,tgt) ← params.inits.any_of (λ param, do
+     let tgt := tgt.mk_app param,
+     prod.mk tgt <$> mk_app cls [tgt]),
+   tgt ← modify_target n [] tgt,
+   -- tgt ← params.enum.mfoldr (λ ⟨i, param⟩ tgt,
+   -- do -- add typeclass hypothesis for each inductive parameter
+   --    tgt ← do {
+   --      guard $ i < env.inductive_num_params n,
+   --      param_cls ← mk_app cls [param] <|> fail "fart",
+   --      -- TODO(sullrich): omit some typeclass parameters based on usage of `param`?
+   --      pure $ expr.pi `a binder_info.inst_implicit param_cls tgt
+   --    } <|> pure tgt,
+   --    pure $ tgt.bind_pi param
+   -- ) tgt,
+   (_, val) ← tactic.solve_aux tgt ( tactic.intros >> tac n type ),
+   val ← instantiate_mvars val,
+   -- tgt ← instantiate_mvars tgt -- >>= trace ∘ expr.list_meta_vars
+   let trusted := decl.is_trusted ∧ cls_decl.is_trusted,
+   add_decl (declaration.defn (n ++ cls)
+             (if univ_poly then decl.univ_params else [])
+             tgt val reducibility_hints.abbrev trusted),
+   set_basic_attribute `instance (n ++ cls) tt,
+   pure true
+else pure false
+
+namespace interactive
+
+open interactive function
+
+meta def build_aux_decl_with (c : name) (type : pexpr) (is_lemma : bool) (tac : tactic unit) : tactic expr :=
+do type' ← to_expr type,
+   ((),v) ← solve_aux type' tac,
+   add_aux_decl c type' v is_lemma
+
+meta def mk_transportable (n : name) (e : expr) : tactic unit :=
+do [v] ← get_goals,
+   trace "begin mk_transportable",
+   trace "-- | TO_FUN",
+   fields ← qualified_field_list n,
+   to_fun ← to_expr ``(Π α β, α ≃ β → %%e α → %%e β)
+     >>= define ( `to_fun),
+   solve1
+     (do α  ← tactic.intro `α,
+         β  ← tactic.intro `β,
+         eq ← tactic.intro `eqv,
+         x ← tactic.intro `x,
+         [v] ← get_goals,
+         refineS ``( { .. } ) none,
+         -- trace_state,
+         all_goals (do
+           tgt ← target,
+           p ← is_prop tgt,
+           if p then admit
+           else do
+             current ← get_current_field n,
+             -- trace current,
+             vs ← tactic.intros,
+             refine ``(@coe_fn _ equiv.has_coe_to_fun %%eq _),
+             mk_mapp current [α,x] >>= tactic.apply <|> fail "add",
+             mmap' (λ v, exact ``(@coe_fn _ equiv.has_coe_to_fun (%%eq).symm %%v)) vs,
+             -- trace_state,
+             return () ),
+         -- instantiate_mvars v >>= trace,
+         return () ),
+   -- inv_fun ← build_aux_decl_with ( (`inv_fun).update_prefix n)
+   --   ``(Π {α β}, %%e β → %%e α) ff
+   --   (do trace_state >> admit),
+   trace "-- | EQUIV",
+   is_inv ← to_expr ``(∀ α β (eqv : equiv α β),
+            left_inverse (%%to_fun β α eqv.symm) (%%to_fun α β eqv))
+          >>= assert `is_inv,
+   solve1 (do
+          α  ← tactic.intro `α,
+          β  ← tactic.intro `β,
+          eq ← tactic.intro `eqv,
+          x ← tactic.intro `x,
+          tactic.cases x,
+          -- trace_state,
+          `[simp only [to_fun]],
+          congr ; funext [] ; dunfold fields (loc.ns [none]) ;
+          `[simp! only [_root_.eq.mpr,equiv.apply_inverse_apply,equiv.inverse_apply_apply]],
+          -- trace_state,
+          return () ),
+   fn ← to_expr ``(Π α β, equiv α β → equiv (%%e α) (%%e β))
+     >>= define ( (`on_equiv).update_prefix n),
+   solve1
+     (do α  ← tactic.intro `α,
+         β  ← tactic.intro `β,
+         eq ← tactic.intro `eqv,
+
+         refineS ``( { to_fun := %%to_fun %%α %%β %%eq,
+                       inv_fun := %%to_fun %%β %%α (%%eq).symm,
+                       left_inv := %%is_inv %%α %%β %%eq }) none,
+         admit ),
+     -- | transport
+   trace "-- | TRANSPORT",
+   refineS ``( { on_equiv := %%fn, .. } ) none, -- (some `duh),
+   admit <|> fail "admit A",
+   admit <|> fail "admit B",
+   trace_state <|> fail "here",
+   -- instantiate_mvars v >>= trace ,
+   trace "end (mk_transportable)"
+
+@[derive_handler]
+meta def transportable_handler : derive_handler :=
+instance_derive_handler' `transportable mk_transportable tt $
+λ n params, pure
+
+-- ``(transportable) _
+
+end interactive
+end tactic
 
 namespace group
 
@@ -101,54 +224,79 @@ lemma inj {x y : β}
   (h : eq.symm x = eq.symm y)
 : x = y := sorry
 
-@[simp]
-def on_equiv.to_fun [group α] : group β :=
-{ one := tr₀ eq (one α)
-, mul := tr₂ eq mul
-, inv := tr₁ eq inv
-, mul_left_inv := by { intros, apply inj eq, simp, apply mul_left_inv }
-, one_mul := by { intros, apply inj eq, simp, apply one_mul }
-, mul_one := by { intros, apply inj eq, simp [has_mul.mul], apply mul_one }
-, mul_assoc := by { intros, apply inj eq, simp, apply mul_assoc }  }
+-- @[simp]
+-- def on_equiv.to_fun [group α] : group β :=
+-- { one := tr₀ eq (one α)
+-- , mul := tr₂ eq mul
+-- , inv := tr₁ eq inv
+-- , mul_left_inv := by { intros, apply inj eq, simp, apply mul_left_inv }
+-- , one_mul := by { intros, apply inj eq, simp, apply one_mul }
+-- , mul_one := by { intros, apply inj eq, simp [has_mul.mul], apply mul_one }
+-- , mul_assoc := by { intros, apply inj eq, simp, apply mul_assoc }  }
 
-@[simp]
-def on_equiv.inv_fun [group β] : group α :=
-{ one := tr₀ eq.symm (one _)
-, mul := tr₂ eq.symm mul
-, inv := tr₁ eq.symm inv
-, mul_left_inv := by { intros, apply inj eq.symm, simp, apply mul_left_inv }
-, one_mul := by { intros, apply inj eq.symm, simp, apply one_mul }
-, mul_one := by { intros, apply inj eq.symm, simp [has_mul.mul], apply mul_one }
-, mul_assoc := by { intros, apply inj eq.symm, simp, apply mul_assoc }  }
+-- @[simp]
+-- def on_equiv.inv_fun [group β] : group α :=
+-- { one := tr₀ eq.symm (one _)
+-- , mul := tr₂ eq.symm mul
+-- , inv := tr₁ eq.symm inv
+-- , mul_left_inv := by { intros, apply inj eq.symm, simp, apply mul_left_inv }
+-- , one_mul := by { intros, apply inj eq.symm, simp, apply one_mul }
+-- , mul_one := by { intros, apply inj eq.symm, simp [has_mul.mul], apply mul_one }
+-- , mul_assoc := by { intros, apply inj eq.symm, simp, apply mul_assoc }  }
 
-def on_equiv : group α ≃ group β :=
-{ to_fun := @on_equiv.to_fun _ _ eq,
-  inv_fun := @on_equiv.inv_fun _ _ eq,
-  right_inv := by { intro x, cases x, simp, -- aargh why do I struggle
-    congr ;
-    -- suffices :  (λ (a1 a2 : α), E.inv_fun (E.to_fun (f _ _))) = (λ a1 a2, f a1 a2),
-    --   by rw this,
-    funext ;
-    dsimp [mul,one,inv] ;
-    simp!, },
-  left_inv := by { intro x, cases x, simp, -- aargh why do I struggle
-    congr ;
-    -- suffices :  (λ (a1 a2 : α), E.inv_fun (E.to_fun (f _ _))) = (λ a1 a2, f a1 a2),
-    --   by rw this,
-    funext ;
-    dsimp [mul,one,inv] ;
-    simp!, } }
+-- def on_equiv' : group α ≃ group β :=
+-- { to_fun := @on_equiv.to_fun _ _ eq,
+--   inv_fun := @on_equiv.inv_fun _ _ eq,
+--   right_inv :=
+--   by { intro x, cases x, simp,
+--        congr ;
+--        funext ;
+--        dsimp [mul,one,inv] ;
+--        simp!, },
+--   left_inv :=
+--   by { intro x, cases x, simp,
+--        congr ;
+--        funext ;
+--        dsimp [mul,one,inv] ;
+--        simp!, } }
 
-def transportable : transportable group :=
-begin
-  refine { on_equiv := @on_equiv, .. }
-  ; intros ; simp [on_equiv,equiv.refl,equiv.trans]
-  ; split ; funext x ; cases x ; refl,
-end
+-- def transportable' : transportable group :=
+-- begin
+--   refine { on_equiv := @on_equiv', .. }
+--   ; intros ; simp [on_equiv',equiv.refl,equiv.trans]
+--   ; split ; funext x ; cases x ; refl,
+-- end
+
+set_option formatter.hide_full_terms false
+set_option pp.all true
+set_option trace.app_builder true
+-- #check equiv.has_coe_to_fun
+
+set_option profiler true
+
+attribute [derive transportable] group monoid ring field --
+-- attribute [derive transportable] monoid
+-- attribute [derive transportable] has_add
+-- ⊢ Π (α β : Type u), α ≃ β → group α → group β
+-- α β : Type u,
+-- eq : α ≃ β
+-- ⊢ group α ≃ group β
+-- on_equiv
+-- 2 goals
+-- case on_refl
+-- ⊢ ∀ (α : Type u), on_equiv α α (equiv.refl α) = equiv.refl (group α)
+
+-- case on_trans
+-- ⊢ ∀ {α β γ : Type u} (d : α ≃ β) (e : β ≃ γ),
+--     on_equiv α γ (equiv.trans d e) = equiv.trans (on_equiv α β d) (on_equiv β γ e)
+-- [_field, on_refl]
+-- [_field, on_trans]
+-- def transportable' : transportable group :=
+
 
 end group
 
-#check derive_attr
+-- #check derive_attr
 instance group.transport {α β : Type u} [R : group α] [e : canonical_equiv α β] : group β :=
 (@transportable.on_equiv group group.transportable _ _ e.to_equiv).to_fun R
 

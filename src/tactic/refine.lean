@@ -1,10 +1,22 @@
 
 import data.dlist
 import util.control.applicative
+import meta.expr
 
 def dlist.join {α} : list (dlist α) → dlist α
  | [] := dlist.empty
  | (x :: xs) := x ++ dlist.join xs
+
+namespace expr
+
+meta def is_mvar : expr → bool
+ | (expr.mvar _ _ _) := tt
+ | _ := ff
+
+meta def list_meta_vars (e : expr) : list expr :=
+e.fold [] (λ e' _ es, if expr.is_mvar e' ∧ ¬ e' ∈ es then e' :: es else es)
+
+end expr
 
 namespace tactic
 
@@ -29,49 +41,57 @@ do env ← get_env,
 
 meta def expanded_field_list' : name → tactic (dlist $ name × name) | struct_n :=
 do (so,fs) ← subobject_names struct_n,
+   -- trace so,
+   -- trace fs,
    ts ← so.mmap (λ n, do
      e ← mk_const (n.update_prefix struct_n) >>= infer_type >>= drop_binders,
      expanded_field_list' $ e.get_app_fn.const_name),
    -- trace so, trace fs,
+   -- trace $ dlist.to_list <$> ts,
+   -- trace struct_n,
    return $ dlist.join ts ++ dlist.of_list (fs.map $ prod.mk struct_n)
+open functor function
 
 meta def expanded_field_list (struct_n : name) : tactic (list $ name × name) :=
 dlist.to_list <$> expanded_field_list' struct_n
+
+meta def qualified_field_list (struct_n : name) : tactic (list name) :=
+map (uncurry $ flip name.update_prefix) <$> expanded_field_list struct_n
+
 
 meta def mk_mvar_list : ℕ → tactic (list expr)
  | 0 := pure []
  | (succ n) := (::) <$> mk_mvar <*> mk_mvar_list n
 
 namespace interactive
-
+open functor
 meta def refineS (e : parse texpr) (ph : parse $ optional $ tk "with" *> ident) : tactic unit :=
 do    str ← e.get_structure_instance_info,
       tgt ← target,
       let struct_n : name := tgt.get_app_fn.const_name,
       exp_fields ← expanded_field_list struct_n,
-      let exp_fields' := exp_fields.map prod.snd,
+      -- let exp_fields' := exp_fields.map prod.snd,
       let missing_f := exp_fields.filter (λ f, (f.2 : name) ∉ str.field_names),
-      let provided := exp_fields.filter (λ f, (f.2 : name) ∈ str.field_names),
+      let provided  := exp_fields.filter (λ f, (f.2 : name) ∈ str.field_names),
       vs ← mk_mvar_list missing_f.length,
-      let e' : pexpr := pexpr.mk_structure_instance
+      e' ← to_expr $ pexpr.mk_structure_instance
           { struct := some struct_n
-          , field_names := str.field_names ++ missing_f.map prod.snd
+          , field_names  := str.field_names ++ missing_f.map prod.snd
           , field_values := str.field_values ++ vs.map to_pexpr },
-      refine e',
+      tactic.exact e',
+      -- trace missing_f,
       gs ← with_enable_tags (
         mmap₂ (λ (n : name × name) v, do
            set_goals [v],
            try (interactive.unfold (provided.map $ λ ⟨s,f⟩, f.update_prefix s) (loc.ns [none])),
+           -- trace n,
            apply_auto_param
              <|> apply_opt_param
-             <|> (do match ph with
-                       | (some ph) := () <$ (mk_const (n.2.update_prefix n.1) >>= pose ph none)
-                       | none := return ()
-                     end,
-                     set_main_tag [`_field,n.2]),
+             <|> (set_main_tag [`_field,n.2,n.1]),
            get_goals)
         missing_f vs),
-      set_goals gs.join
+      set_goals gs.join,
+      return ()
 
 meta def collect_tagged_goals (pre : name) : tactic (list expr) :=
 do gs ← get_goals,
@@ -94,6 +114,14 @@ do ts ← collect_tagged_goals tag,
       solve1 tac
     | _ := fail format!"multiple goals have tag {tag}"
    end
+
+meta def get_current_field (t : name) : tactic name :=
+do [_,field,str] ← get_main_tag,
+   -- trace format!"{field} - {str}",
+   expr.const_name <$> resolve_name (field.update_prefix str)
+
+-- meta def current_field (t : name) (c : name := `current) : tactic unit :=
+-- () <$ (get_current_field t >>= mk_const >>= pose c none)
 
 end interactive
 
