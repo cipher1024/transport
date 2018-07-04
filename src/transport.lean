@@ -1,11 +1,17 @@
 import data.list.basic
-import data.equiv
-
+import data.equiv.basic
+import tactic
 import tactic.refine
 
 universes u v w
 
+open function
+
 class canonical_equiv (α : Sort*) (β : Sort*) extends equiv α β.
+
+def equiv.injective {α : Sort*} {β : Sort*} (eq : α ≃ β) :
+  injective eq :=
+injective_of_left_inverse eq.left_inv
 
 class transportable (f : Type u → Type v) :=
 (on_equiv : Π {α β : Type u} (e : equiv α β), equiv (f α) (f β))
@@ -87,6 +93,76 @@ do type' ← to_expr type,
    ((),v) ← solve_aux type' tac,
    add_aux_decl c type' v is_lemma
 
+open functor
+
+def strip_prefix (n : name) : name :=
+name.update_prefix n name.anonymous
+#check @equiv.injective
+#print injective
+
+meta def all_field_names : tactic (list name) :=
+do gs ← get_goals,
+   gs.mmap (λ g, set_goals [g] >> get_current_field)
+   <* set_goals gs
+
+meta def mk_to_fun (n : name := `group) : tactic unit :=
+do env  ← get_env,
+   decl ← env.get n,
+   let univs := decl.univ_params,
+   e ← resolve_name n,
+   fields ← qualified_field_list n,
+   t ← to_expr ``(Π α β : Type u, α ≃ β → %%e α → %%e β),
+   (_,d) ← solve_aux t
+     (do α  ← tactic.intro `α, β  ← tactic.intro `β, eq_ ← tactic.intro `eqv,
+         eqv ← to_expr ``(@coe_fn _ equiv.has_coe_to_fun (%%eq_)),
+         eqv_symm ← to_expr ``(@coe_fn _ equiv.has_coe_to_fun (%%eq_).symm),
+         x ← tactic.intro `x,
+         [v] ← get_goals,
+         refine_struct ``( { .. } ),
+         let unfold_more := [`has_one.one, `has_mul.mul,`semigroup.mul,`group.mul],
+         fs ← all_field_names >>= mmap resolve_name ∘ list.append unfold_more,
+         all_goals (do
+           fl ← get_current_field,
+           xs ← tactic.intros,
+           e ← mk_app fl $ map eqv_symm xs,
+           tactic.exact (eqv e) <|> (do
+             refine ``((equiv.apply_eq_iff_eq (%%eq_).symm _ _).1 _),
+             refine ``(iff.elim_left (eq.to_iff _) %%e),
+             -- simp (some ()) ff (map simp_arg_type.expr $ ``(@equiv.inverse_apply_apply) :: fs) [] (loc.ns [none]),
+             -- simp (some ()) ff (map simp_arg_type.expr $ fs) [] (loc.ns [none]),
+             -- repeat $ dsimp ff (map simp_arg_type.expr $ fs ++ [``(@equiv.inverse_apply_apply)]) [] (loc.ns [none]),
+             simp (some ()) ff (map simp_arg_type.expr $ fs ++ [``(@equiv.inverse_apply_apply)]) [] (loc.ns [none]),
+             -- try $ simp (some ()) ff (map simp_arg_type.expr $ fs ++ [``(@has_mul.mul),``(@equiv.inverse_apply_apply)]) [] (loc.ns [none]),
+             -- repeat `[rw [equiv.inverse_apply_apply]],
+             done <|> refl <|> (congr; done <|> refl)))),
+   d ← instantiate_mvars d,
+   add_decl $ mk_definition (n <.> "transport" <.> "to_fun") univs t d
+
+-- set_option pp.universes true
+-- set_option pp.notation false
+-- set_option pp.implicit true
+
+-- run_cmd add_interactive [`mk_to_fun]
+
+run_cmd mk_to_fun `group
+
+example  : Π {α β : Type u} (e : equiv α β), equiv (group α) (group β) :=
+begin
+  introv eqv,
+  refine_struct { to_fun  := @group.transport.to_fun _ _ eqv
+                , inv_fun := @group.transport.to_fun _ _ eqv.symm
+                , .. };
+  dsimp [left_inverse,function.right_inverse];
+  intro x ; dunfold group.transport.to_fun;
+  cases x; congr; funext;
+  simp only [equiv.inverse_apply_apply,equiv.apply_inverse_apply,id],
+end
+
+#check congr_arg
+
+
+#print group.transport.to_fun
+
 meta def mk_transportable (n : name) (e : expr) : tactic unit :=
 do [v] ← get_goals,
    trace "begin mk_transportable",
@@ -98,24 +174,58 @@ do [v] ← get_goals,
      (do α  ← tactic.intro `α,
          β  ← tactic.intro `β,
          eq ← tactic.intro `eqv,
+         eqv ← to_expr ``(@coe_fn _ equiv.has_coe_to_fun (%%eq)),
+         eqv_symm ← to_expr ``(@coe_fn _ equiv.has_coe_to_fun (%%eq).symm),
          x ← tactic.intro `x,
          [v] ← get_goals,
-         refineS ``( { .. } ) none,
+         refine_struct ``( { .. } ),
          -- trace_state,
          all_goals (do
            tgt ← target,
            p ← is_prop tgt,
-           if p then admit
-           else do
-             current ← get_current_field n,
-             -- trace current,
+           if p then do
+             trace "A",
+             current ← get_current_field <|> fail "get_current_field",
              vs ← tactic.intros,
-             refine ``(@coe_fn _ equiv.has_coe_to_fun %%eq _),
-             mk_mapp current [α,x] >>= tactic.apply <|> fail "add",
-             mmap' (λ v, exact ``(@coe_fn _ equiv.has_coe_to_fun (%%eq).symm %%v)) vs,
+             h ← mk_mapp current ( [α,x] ++ vs.map (some ∘ eqv_symm) ) >>= note `h none
+               <|> fail "mk_mapp",
+             unfold (fields) (loc.ns [none,h.local_pp_name]), -- h.local_pp_name]),
+             h ← get_local h.local_pp_name,
+             infer_type h >>= trace,
+             -- tactic.revert h,
+             fs ← mmap (resolve_name ∘ strip_prefix) fields,
+             simp (some ()) tt (map simp_arg_type.expr $ [``(equiv.apply_inverse_apply),``(equiv.inverse_apply_apply)] ++ fs) [] (loc.ns [none,h.local_pp_name]), -- ,h.local_pp_name
+             -- h ← get_local h.local_pp_name,
+             -- infer_type h >>= trace,
+             trace_state,
+             -- target >>= trace,
+             -- tactic.exact h,
+             done,
+             trace "C",
+             return ()
+           else do
+             trace "B",
+             -- target >>= trace,
+             -- [v] ← get_goals,
+             current ← get_current_field,
+             trace current,
+             vs ← tactic.intros,
+             -- infer_type eqv_symm >>= trace,
+             -- refine ``(%%eqv _) <|> fail "refine",
+             trace eqv_symm,
+             -- trace vs,
+             -- instantiate_mvars v >>= trace,
+             let vs' := map (some ∘ eqv_symm) vs,
+             e ← mk_mapp current ( [α,x] ++ vs' ),
+             e ← to_expr ``(@coe_fn _ equiv.has_coe_to_fun %%eq %%e),
+             trace "to_expr",
+             trace e,
+             tactic.exact e,
+             trace "C",
              -- trace_state,
              return () ),
          -- instantiate_mvars v >>= trace,
+         trace_state,
          return () ),
    -- inv_fun ← build_aux_decl_with ( (`inv_fun).update_prefix n)
    --   ``(Π {α β}, %%e β → %%e α) ff
@@ -143,13 +253,13 @@ do [v] ← get_goals,
          β  ← tactic.intro `β,
          eq ← tactic.intro `eqv,
 
-         refineS ``( { to_fun := %%to_fun %%α %%β %%eq,
+         refine_struct ``( { to_fun := %%to_fun %%α %%β %%eq,
                        inv_fun := %%to_fun %%β %%α (%%eq).symm,
-                       left_inv := %%is_inv %%α %%β %%eq }) none,
+                       left_inv := %%is_inv %%α %%β %%eq }),
          admit ),
      -- | transport
    trace "-- | TRANSPORT",
-   refineS ``( { on_equiv := %%fn, .. } ) none, -- (some `duh),
+   refine_struct ``( { on_equiv := %%fn, .. } ), -- (some `duh),
    admit <|> fail "admit A",
    admit <|> fail "admit B",
    trace_state <|> fail "here",
@@ -267,14 +377,14 @@ lemma inj {x y : β}
 --   ; split ; funext x ; cases x ; refl,
 -- end
 
-set_option formatter.hide_full_terms false
+-- set_option formatter.hide_full_terms false
 set_option pp.all true
-set_option trace.app_builder true
+-- set_option trace.app_builder true
 -- #check equiv.has_coe_to_fun
 
-set_option profiler true
+-- set_option profiler true
 
-attribute [derive transportable] group monoid ring field --
+-- attribute [derive transportable] group monoid ring field --
 -- attribute [derive transportable] monoid
 -- attribute [derive transportable] has_add
 -- ⊢ Π (α β : Type u), α ≃ β → group α → group β
@@ -298,7 +408,8 @@ end group
 
 -- #check derive_attr
 instance group.transport {α β : Type u} [R : group α] [e : canonical_equiv α β] : group β :=
-(@transportable.on_equiv group group.transportable _ _ e.to_equiv).to_fun R
+sorry
+-- (@transportable.on_equiv group group.transportable _ _ e.to_equiv).to_fun R
 
 
 -- class transportable (f : Type u → Type v) :=
